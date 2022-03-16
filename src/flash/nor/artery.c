@@ -587,11 +587,11 @@ static int artery_write(struct flash_bank *bank, const uint8_t *buffer,
     if (retval != ERROR_OK)
         return retval;
 
-    /* First write word by word */
-    while( bytes_written < ( count - 1 ) )
+    /* First write word by word, as it provides the highest write speed */
+    while( bytes_written < ( count - 3 ) )
     {
-        uint16_t value;
-        memcpy(&value, buffer + bytes_written, sizeof(uint16_t));
+        uint32_t value;
+        memcpy(&value, buffer + bytes_written, sizeof(value));
 
         /* Set the PRGM bit = 1 in FLASH_CTRL */
         retval = target_write_u32(target, EFC_CTRL_REG, EFC_PRGM_BIT);
@@ -599,7 +599,7 @@ static int artery_write(struct flash_bank *bank, const uint8_t *buffer,
             return retval;
 
         /* Write byte to flash */
-        retval = target_write_u16(target, writeAddress + bytes_written, value);
+        retval = target_write_u32(target, writeAddress + bytes_written, value);
         if (retval != ERROR_OK)
             return retval;
 
@@ -607,11 +607,11 @@ static int artery_write(struct flash_bank *bank, const uint8_t *buffer,
         if (retval != ERROR_OK)
             return retval;
 
-        bytes_written += 2;
+        bytes_written += 4;
     }
 
     /* Write potential last byte */
-    if(bytes_written < count)
+    while(bytes_written < count)
     {
         /* Set the PRGM bit = 1 in FLASH_CTRL */
         retval = target_write_u32(target, EFC_CTRL_REG, EFC_PRGM_BIT);
