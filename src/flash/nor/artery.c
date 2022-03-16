@@ -14,6 +14,8 @@
  *   along with this program.  If not, see <http://www.gnu.org/licenses/>. *
  ***************************************************************************/
 
+/* Only tested on AT32F415 */
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -27,6 +29,7 @@
 #define FLASHSIZEADDR       0x1FFFF7E0
 #define DEVICEUIDADDR       0x1FFFF7E8
 #define MASKVERSIONADDR     0x1FFFF7F1
+#define FLASHBASEADDR       0x08000000
 
 
 struct artery_flash_bank {
@@ -36,8 +39,8 @@ struct artery_flash_bank {
 struct artery_chip_info
 {
     uint32_t chip_id;
-    int flash_size_kB;
-    int sector_size;
+    uint32_t flash_size_kB;
+    uint32_t sector_size;
     char * chip_name;
 };
 
@@ -242,11 +245,27 @@ static int artery_find_chip_from_id(uint32_t id, const struct artery_chip_info**
     return ERROR_FAIL;
 }
 
+static int artery_guess_sector_size_from_flash_size(int flash_size_kb)
+{
+    /* According to device DB, devices with 4096 byte sectors do not have a power of 2 kB of FLASH */
+    if((flash_size_kb & (flash_size_kb - 1)) != 0)
+        return 4096;
+
+    /* According to AT32F415 code examples, FLASH <= 128kB means 1024 bytes setor size */
+    if(flash_size_kb <= 128)
+        return 1024;
+
+    /* Other devices have 2048 bytes per sectors */
+    return 2048;
+}
+
 static int artery_probe(struct flash_bank *bank)
 {
     struct target *target = bank->target;
     struct artery_flash_bank *artery_bank_info = bank->driver_priv;
-    uint32_t flash_size_in_kb;
+    uint32_t device_id = 0, flash_size_in_kb = 0, sector_size = 0;
+    unsigned int num_sectors;
+    const struct artery_chip_info* chip_info = 0;
     int retval;
 
     artery_bank_info->probed = false;
@@ -256,6 +275,14 @@ static int artery_probe(struct flash_bank *bank)
         return ERROR_TARGET_NOT_EXAMINED;
     }
 
+    /* Read device ID */
+    retval = target_read_u32(target, MCUDEVICEIDADDR, &device_id);
+    if (retval != ERROR_OK)
+    {
+        LOG_WARNING("Cannot read device ID.");
+        return retval;
+    }
+
     /* get flash size from target. */
     retval = target_read_u32(target, FLASHSIZEADDR, &flash_size_in_kb);
     if(retval != ERROR_OK || flash_size_in_kb == 0xffffffff || flash_size_in_kb == 0)
@@ -263,11 +290,54 @@ static int artery_probe(struct flash_bank *bank)
         LOG_WARNING("Cannot read flash size.");
         return ERROR_FAIL;
     }
-    LOG_INFO("flash size = %" PRIu16 " kbytes", flash_size_in_kb);
+
+    /* look up chip id in known chip db */
+    retval = artery_find_chip_from_id(device_id, &chip_info);
+    if(retval == ERROR_OK)
+    {
+        /* known flash size matches read flash size. Trust known sector size */
+        if(flash_size_in_kb == chip_info->flash_size_kB)
+        {
+            sector_size = chip_info->sector_size;
+            LOG_INFO("Chip: %s, %" PRIi32 "kB FLASH, %" PRIi32 " bytes sectors", chip_info->chip_name, flash_size_in_kb, sector_size);
+        }
+
+        /* Known flash size does not match read flash size. Guess sector size */
+        else
+        {
+            sector_size = artery_guess_sector_size_from_flash_size(flash_size_in_kb);
+            LOG_INFO("Chip: %s, %" PRIi32 "kB FLASH expected, but %" PRIi32 "kB detected. Guessing %" PRIi32 " bytes sectors", chip_info->chip_name, chip_info->flash_size_kB, flash_size_in_kb, sector_size);
+        }
+    }
+
+    /* Unknown chip. Guess sector size */
+    else
+    {
+        sector_size = artery_guess_sector_size_from_flash_size(flash_size_in_kb);
+        LOG_INFO("Unknown chip id: %" PRIi32 ", %" PRIi32 "kB FLASH detected. Guessing %" PRIi32 " bytes sectors", device_id, flash_size_in_kb, sector_size);
+    }
 
 
-    LOG_ERROR("Cannot identify target as a Artery AT32 family.");
+    num_sectors = (flash_size_in_kb << 10) / sector_size;
+    if((num_sectors * sector_size) != (flash_size_in_kb << 10))
+    {
+        LOG_ERROR("Total FLASH size does not match sector size times sectors count !");
+        return ERROR_FAIL;
+    }
 
+    bank->base = FLASHBASEADDR;
+    bank->num_sectors = num_sectors;
+    bank->sectors = calloc(num_sectors, sizeof(struct flash_sector));
+    bank->size = flash_size_in_kb << 10;
+    for (unsigned int i = 0; i < num_sectors; i++) {
+        bank->sectors[i].offset = i * sector_size;
+        bank->sectors[i].size = sector_size;
+        bank->sectors[i].is_erased = -1;
+        bank->sectors[i].is_protected = -1;
+    }
+    LOG_DEBUG("allocated %u sectors", num_sectors);
+
+    artery_bank_info->probed = true;
     return ERROR_OK;
 }
 
@@ -335,10 +405,11 @@ static int artery_print_info(struct flash_bank *bank, struct command_invocation 
         return retval;
     }
 
+    /* look up chip id in known chip db */
     retval = artery_find_chip_from_id(device_id, &chip_info);
     if(retval == ERROR_OK)
     {
-        command_print_sameline(cmd, "%s Rev. %c, %" PRIi32 "kB FLASH", chip_info->chip_name, mask_version, flash_size_in_kb);
+        command_print_sameline(cmd, "Chip: %s Rev. %c, %" PRIi32 "kB FLASH", chip_info->chip_name, mask_version, flash_size_in_kb);
     }
     else
     {
