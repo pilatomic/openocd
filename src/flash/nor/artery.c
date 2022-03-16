@@ -32,6 +32,7 @@
 #define FLASH_BASE_ADDR         0x08000000
 
 #define EFC_CTRL_REG            0x40022010
+#define EFC_PRGM_BIT            (1<<0)
 #define EFC_PGERS_BIT           (1<<1)
 #define EFC_RSTR_BIT            (1<<6)
 #define EFC_LOCK_BIT            (1<<7)
@@ -46,8 +47,8 @@
 #define EFC_PRCDN_BIT           (1<<5)
 #define EFC_ADDR_REG            0x40022014
 
-#define FLASH_ERASE_TIMEOUT 10000
-
+#define FLASH_ERASE_TIMEOUT 100     /* 10ms actually required */
+#define FLASH_WRITE_TIMEOUT 10      /* 42us actually required */
 
 struct artery_flash_bank {
 	bool probed;
@@ -469,7 +470,6 @@ static int artery_wait_status_busy(struct flash_bank *bank, int timeout)
         alive_sleep(1);
     }
 
-
     if (status & EFC_WRPRTFLR_BIT) {
         LOG_ERROR("Device protected");
         retval = ERROR_FAIL;
@@ -565,12 +565,47 @@ static int artery_erase(struct flash_bank *bank, unsigned int first,
             return retval;
     }
 
+    /* Re-lock flash */
     retval = target_write_u32(target, EFC_CTRL_REG, EFC_LOCK_BIT);
+    return retval;
+}
+
+static int artery_write(struct flash_bank *bank, const uint8_t *buffer,
+        uint32_t offset, uint32_t count)
+{
+    struct target *target = bank->target;
+
+    if (bank->target->state != TARGET_HALTED) {
+        LOG_ERROR("Target not halted");
+        return ERROR_TARGET_NOT_HALTED;
+    }
+
+    int retval;
+    retval = artery_unlock_flash_write(target);
     if (retval != ERROR_OK)
         return retval;
 
-    return ERROR_OK;
+    uint32_t writeAddress = bank->base + offset;
+    for( uint32_t bytes_written = 0 ; bytes_written < count ; bytes_written++)
+    {
+        /* Set the PRGM bit = 1 in FLASH_CTRL */
+        retval = target_write_u32(target, EFC_CTRL_REG, EFC_PRGM_BIT);
+        if (retval != ERROR_OK)
+            return retval;
 
+        /* Write byte to flash */
+        retval = target_write_u8(target, writeAddress + bytes_written, buffer[bytes_written]);
+        if (retval != ERROR_OK)
+            return retval;
+
+        retval = artery_wait_status_busy(bank, FLASH_WRITE_TIMEOUT);
+        if (retval != ERROR_OK)
+            return retval;
+    }
+
+    /* Re-lock flash */
+    retval = target_write_u32(target, EFC_CTRL_REG, EFC_LOCK_BIT);
+    return retval;
 }
 
 static const struct command_registration artery_command_handlers[] = {
@@ -591,7 +626,7 @@ const struct flash_driver artery_flash = {
     .flash_bank_command = artery_flash_bank_command,
     .erase = artery_erase,
     .protect = NULL,
-    .write = NULL,
+    .write = artery_write,
 	.read = default_flash_read,
     .probe = artery_probe,
     .auto_probe = artery_auto_probe,

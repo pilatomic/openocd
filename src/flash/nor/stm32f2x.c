@@ -847,13 +847,11 @@ static int stm32x_write(struct flash_bank *bank, const uint8_t *buffer,
 	2. Set the PG bit in the FLASH_CR register
 	3. Perform the data write operation(s) to the desired memory address (inside main
 	  memory block or OTP area):
-	– – Half-word access in case of x16 parallelism
+    – Half-word access in case of x16 parallelism
 	– Word access in case of x32 parallelism
-	–
-	4.
-	Byte access in case of x8 parallelism
-	Double word access in case of x64 parallelism
-	Wait for the BSY bit to be cleared
+    – Byte access in case of x8 parallelism
+    - Double word access in case of x64 parallelism
+    4. Wait for the BSY bit to be cleared
 	*/
 	while (words_remaining > 0) {
 		uint16_t value;
@@ -1003,7 +1001,7 @@ static int stm32x_probe(struct flash_bank *bank)
 	stm32x_info->protection_bits = 12;		/* max. number of nWRPi bits (in FLASH_OPTCR !!!) */
 	num_prot_blocks = 0;
 
-	free(bank->sectors);
+    free(bank->sectors);
 	bank->num_sectors = 0;
 	bank->sectors = NULL;
 
