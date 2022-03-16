@@ -263,8 +263,10 @@ static int artery_probe(struct flash_bank *bank)
 {
     struct target *target = bank->target;
     struct artery_flash_bank *artery_bank_info = bank->driver_priv;
-    uint32_t device_id = 0, flash_size_in_kb = 0, sector_size = 0;
+    uint32_t device_id, sector_size;
+    uint16_t read_flash_size_in_kb;
     unsigned int num_sectors;
+    unsigned int flash_size;
     const struct artery_chip_info* chip_info = 0;
     int retval;
 
@@ -284,8 +286,8 @@ static int artery_probe(struct flash_bank *bank)
     }
 
     /* get flash size from target. */
-    retval = target_read_u32(target, FLASHSIZEADDR, &flash_size_in_kb);
-    if(retval != ERROR_OK || flash_size_in_kb == 0xffffffff || flash_size_in_kb == 0)
+    retval = target_read_u16(target, FLASHSIZEADDR, &read_flash_size_in_kb);
+    if(retval != ERROR_OK || read_flash_size_in_kb == 0xffff || read_flash_size_in_kb == 0)
     {
         LOG_WARNING("Cannot read flash size.");
         return ERROR_FAIL;
@@ -296,30 +298,32 @@ static int artery_probe(struct flash_bank *bank)
     if(retval == ERROR_OK)
     {
         /* known flash size matches read flash size. Trust known sector size */
-        if(flash_size_in_kb == chip_info->flash_size_kB)
+        if(read_flash_size_in_kb == chip_info->flash_size_kB)
         {
             sector_size = chip_info->sector_size;
-            LOG_INFO("Chip: %s, %" PRIi32 "kB FLASH, %" PRIi32 " bytes sectors", chip_info->chip_name, flash_size_in_kb, sector_size);
+            LOG_INFO("Chip: %s, %" PRIi32 "kB FLASH, %" PRIi32 " bytes sectors", chip_info->chip_name, read_flash_size_in_kb, sector_size);
         }
 
         /* Known flash size does not match read flash size. Guess sector size */
         else
         {
-            sector_size = artery_guess_sector_size_from_flash_size(flash_size_in_kb);
-            LOG_INFO("Chip: %s, %" PRIi32 "kB FLASH expected, but %" PRIi32 "kB detected. Guessing %" PRIi32 " bytes sectors", chip_info->chip_name, chip_info->flash_size_kB, flash_size_in_kb, sector_size);
+            sector_size = artery_guess_sector_size_from_flash_size(read_flash_size_in_kb);
+            LOG_INFO("Chip: %s, %" PRIi32 "kB FLASH expected, but %" PRIi32 "kB detected. Guessing %" PRIi32 " bytes sectors", chip_info->chip_name, chip_info->flash_size_kB, read_flash_size_in_kb, sector_size);
         }
     }
 
     /* Unknown chip. Guess sector size */
     else
     {
-        sector_size = artery_guess_sector_size_from_flash_size(flash_size_in_kb);
-        LOG_INFO("Unknown chip id: %" PRIi32 ", %" PRIi32 "kB FLASH detected. Guessing %" PRIi32 " bytes sectors", device_id, flash_size_in_kb, sector_size);
+        sector_size = artery_guess_sector_size_from_flash_size(read_flash_size_in_kb);
+        LOG_INFO("Unknown chip id: %" PRIi32 ", %" PRIi32 "kB FLASH detected. Guessing %" PRIi32 " bytes sectors", device_id, read_flash_size_in_kb, sector_size);
     }
 
+    flash_size = read_flash_size_in_kb;
+    flash_size <<= 10;
 
-    num_sectors = (flash_size_in_kb << 10) / sector_size;
-    if((num_sectors * sector_size) != (flash_size_in_kb << 10))
+    num_sectors = flash_size / sector_size;
+    if((num_sectors * sector_size) != flash_size)
     {
         LOG_ERROR("Total FLASH size does not match sector size times sectors count !");
         return ERROR_FAIL;
@@ -328,7 +332,7 @@ static int artery_probe(struct flash_bank *bank)
     bank->base = FLASHBASEADDR;
     bank->num_sectors = num_sectors;
     bank->sectors = calloc(num_sectors, sizeof(struct flash_sector));
-    bank->size = flash_size_in_kb << 10;
+    bank->size = flash_size;
     for (unsigned int i = 0; i < num_sectors; i++) {
         bank->sectors[i].offset = i * sector_size;
         bank->sectors[i].size = sector_size;
@@ -375,7 +379,7 @@ static int artery_print_info(struct flash_bank *bank, struct command_invocation 
 {
     struct target *target = bank->target;
     uint32_t device_id;
-    uint32_t flash_size_in_kb;
+    uint16_t flash_size_in_kb;
     uint8_t mask_version;
     int retval;
     const struct artery_chip_info* chip_info = 0;
@@ -398,8 +402,8 @@ static int artery_print_info(struct flash_bank *bank, struct command_invocation 
     mask_version = ((mask_version >> 4) & 0x07) + 'A';
 
     /* Read Flash size */
-    retval = target_read_u32(target, FLASHSIZEADDR, &flash_size_in_kb);
-    if(retval != ERROR_OK || flash_size_in_kb == 0xffffffff || flash_size_in_kb == 0)
+    retval = target_read_u16(target, FLASHSIZEADDR, &flash_size_in_kb);
+    if(retval != ERROR_OK || flash_size_in_kb == 0xffff || flash_size_in_kb == 0)
     {
         LOG_WARNING("Cannot read flash size.");
         return retval;
