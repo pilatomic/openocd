@@ -25,11 +25,28 @@
 #include <target/algorithm.h>
 #include <target/cortex_m.h>
 
-#define MCUDEVICEIDADDR     0xE0042000
-#define FLASHSIZEADDR       0x1FFFF7E0
-#define DEVICEUIDADDR       0x1FFFF7E8
-#define MASKVERSIONADDR     0x1FFFF7F1
-#define FLASHBASEADDR       0x08000000
+#define MCU_DEVICE_ID_ADDR      0xE0042000
+#define FLASH_SIZE_ADDR         0x1FFFF7E0
+#define DEVICE_UID_ADDR         0x1FFFF7E8
+#define MASK_VERSION_ADDR       0x1FFFF7F1
+#define FLASH_BASE_ADDR         0x08000000
+
+#define EFC_CTRL_REG            0x40022010
+#define EFC_PGERS_BIT           (1<<1)
+#define EFC_RSTR_BIT            (1<<6)
+#define EFC_LOCK_BIT            (1<<7)
+#define EFC_FCKEY_REG           0x40022004
+#define EFC_KEY1                0x45670123
+#define EFC_KEY2                0xCDEF89AB
+#define EFC_RDPRTEN             0x00A5
+#define EFC_STS_REG             0x4002200C
+#define EFC_BSY_BIT             (1<<0)
+#define EFC_PRGMFLR_BIT         (1<<2)
+#define EFC_WRPRTFLR_BIT        (1<<4)
+#define EFC_PRCDN_BIT           (1<<5)
+#define EFC_ADDR_REG            0x40022014
+
+#define FLASH_ERASE_TIMEOUT 10000
 
 
 struct artery_flash_bank {
@@ -272,13 +289,21 @@ static int artery_probe(struct flash_bank *bank)
 
     artery_bank_info->probed = false;
 
+    free(bank->sectors);
+    bank->num_sectors = 0;
+    bank->sectors = NULL;
+
+    free(bank->prot_blocks);
+    bank->num_prot_blocks = 0;
+    bank->prot_blocks = NULL;
+
     if (!target_was_examined(target)) {
         LOG_ERROR("Target not examined yet");
         return ERROR_TARGET_NOT_EXAMINED;
     }
 
     /* Read device ID */
-    retval = target_read_u32(target, MCUDEVICEIDADDR, &device_id);
+    retval = target_read_u32(target, MCU_DEVICE_ID_ADDR, &device_id);
     if (retval != ERROR_OK)
     {
         LOG_WARNING("Cannot read device ID.");
@@ -286,7 +311,7 @@ static int artery_probe(struct flash_bank *bank)
     }
 
     /* get flash size from target. */
-    retval = target_read_u16(target, FLASHSIZEADDR, &read_flash_size_in_kb);
+    retval = target_read_u16(target, FLASH_SIZE_ADDR, &read_flash_size_in_kb);
     if(retval != ERROR_OK || read_flash_size_in_kb == 0xffff || read_flash_size_in_kb == 0)
     {
         LOG_WARNING("Cannot read flash size.");
@@ -329,7 +354,7 @@ static int artery_probe(struct flash_bank *bank)
         return ERROR_FAIL;
     }
 
-    bank->base = FLASHBASEADDR;
+    bank->base = FLASH_BASE_ADDR;
     bank->num_sectors = num_sectors;
     bank->sectors = calloc(num_sectors, sizeof(struct flash_sector));
     bank->size = flash_size;
@@ -338,6 +363,7 @@ static int artery_probe(struct flash_bank *bank)
         bank->sectors[i].size = sector_size;
         bank->sectors[i].is_erased = -1;
         bank->sectors[i].is_protected = -1;
+        /* Currently we simply ignore sector protection. TODO : implement protection read / write */
     }
     LOG_DEBUG("allocated %u sectors", num_sectors);
 
@@ -358,7 +384,6 @@ FLASH_BANK_COMMAND_HANDLER(artery_flash_bank_command)
     bank->driver_priv = artery_bank_info;
 
     artery_bank_info->probed = false;
-    //stm32x_info->user_bank_size = bank->size;
 
     return ERROR_OK;
 }
@@ -385,7 +410,7 @@ static int artery_print_info(struct flash_bank *bank, struct command_invocation 
     const struct artery_chip_info* chip_info = 0;
 
     /* Read device ID */
-    retval = target_read_u32(target, MCUDEVICEIDADDR, &device_id);
+    retval = target_read_u32(target, MCU_DEVICE_ID_ADDR, &device_id);
     if (retval != ERROR_OK)
     {
         LOG_WARNING("Cannot read device ID.");
@@ -393,7 +418,7 @@ static int artery_print_info(struct flash_bank *bank, struct command_invocation 
     }
 
     /* Read revision */
-    retval = target_read_u8(target, MASKVERSIONADDR, &mask_version);
+    retval = target_read_u8(target, MASK_VERSION_ADDR, &mask_version);
     if (retval != ERROR_OK)
     {
         LOG_WARNING("Cannot read mask version.");
@@ -402,7 +427,7 @@ static int artery_print_info(struct flash_bank *bank, struct command_invocation 
     mask_version = ((mask_version >> 4) & 0x07) + 'A';
 
     /* Read Flash size */
-    retval = target_read_u16(target, FLASHSIZEADDR, &flash_size_in_kb);
+    retval = target_read_u16(target, FLASH_SIZE_ADDR, &flash_size_in_kb);
     if(retval != ERROR_OK || flash_size_in_kb == 0xffff || flash_size_in_kb == 0)
     {
         LOG_WARNING("Cannot read flash size.");
@@ -423,6 +448,131 @@ static int artery_print_info(struct flash_bank *bank, struct command_invocation 
     return ERROR_OK;
 }
 
+static int artery_wait_status_busy(struct flash_bank *bank, int timeout)
+{
+    struct target *target = bank->target;
+    uint32_t status;
+    int retval = ERROR_OK;
+
+    /* wait for busy to clear */
+    for (;;) {
+        retval = target_read_u32(target, EFC_STS_REG, &status);
+        if (retval != ERROR_OK)
+            return retval;
+        LOG_DEBUG("status: 0x%" PRIx32, status);
+        if ((status & EFC_BSY_BIT) == 0)
+            break;
+        if (timeout-- <= 0) {
+            LOG_ERROR("timed out waiting for flash");
+            return ERROR_FAIL;
+        }
+        alive_sleep(1);
+    }
+
+
+    if (status & EFC_WRPRTFLR_BIT) {
+        LOG_ERROR("Device protected");
+        retval = ERROR_FAIL;
+    }
+
+    /* Clear but report errors */
+    if (status & EFC_WRPRTFLR_BIT) {
+        LOG_ERROR("Attempt to write an address that has not been erased before");
+        retval = ERROR_FAIL;
+    }
+    return retval;
+}
+
+
+static int artery_unlock_flash_write(struct target *target)
+{
+    uint32_t ctrl;
+
+    int retval = target_read_u32(target, EFC_CTRL_REG, &ctrl);
+    if (retval != ERROR_OK)
+        return retval;
+
+    if ((ctrl & EFC_LOCK_BIT) == 0)
+        return ERROR_OK;
+
+    /* unlock flash registers */
+    retval = target_write_u32(target, EFC_FCKEY_REG, EFC_KEY1);
+    if (retval != ERROR_OK)
+        return retval;
+
+    retval = target_write_u32(target, EFC_FCKEY_REG, EFC_KEY2);
+    if (retval != ERROR_OK)
+        return retval;
+
+    retval = target_read_u32(target, EFC_CTRL_REG, &ctrl);
+    if (retval != ERROR_OK)
+        return retval;
+
+    if (ctrl & EFC_LOCK_BIT) {
+        LOG_ERROR("flash not unlocked FLASH_CTRL: 0x%" PRIx32, ctrl);
+        return ERROR_TARGET_FAILURE;
+    }
+
+    return ERROR_OK;
+}
+
+static int artery_erase(struct flash_bank *bank, unsigned int first,
+        unsigned int last)
+{
+    struct target *target = bank->target;
+
+    assert((first <= last) && (last < bank->num_sectors));
+
+    if (bank->target->state != TARGET_HALTED) {
+        LOG_ERROR("Target not halted");
+        return ERROR_TARGET_NOT_HALTED;
+    }
+
+    int retval;
+    retval = artery_unlock_flash_write(target);
+    if (retval != ERROR_OK)
+        return retval;
+
+    /* Wait for flash not busy */
+    retval = artery_wait_status_busy(bank, FLASH_ERASE_TIMEOUT);
+    if (retval != ERROR_OK)
+        return retval;
+
+    for (unsigned int i = first; i <= last; i++)
+    {
+        /* Clear status register beforehand */
+        target_write_u32(target, EFC_STS_REG, EFC_PRCDN_BIT | EFC_WRPRTFLR_BIT | EFC_PRGMFLR_BIT);
+
+        /* Set the PGERS bit in the FLASH_CTRLx register */
+        retval = target_write_u32(target, EFC_CTRL_REG, EFC_PGERS_BIT);
+        if (retval != ERROR_OK)
+            return retval;
+
+        /* Select the page to be erased with the FLASH_ADDRx register */
+        uint32_t eraseAddress = bank->base + bank->sectors[i].offset;
+        retval = target_write_u32(target, EFC_ADDR_REG, eraseAddress);
+        if (retval != ERROR_OK)
+            return retval;
+
+        /* Set the RSTR bit in the FLASH_CTRLx register */
+        retval = target_write_u32(target, EFC_CTRL_REG, EFC_PGERS_BIT | EFC_RSTR_BIT);
+        if (retval != ERROR_OK)
+            return retval;
+
+        /* Wait for flash not busy */
+        retval = artery_wait_status_busy(bank, FLASH_ERASE_TIMEOUT);
+        if (retval != ERROR_OK)
+            return retval;
+    }
+
+    retval = target_write_u32(target, EFC_CTRL_REG, EFC_LOCK_BIT);
+    if (retval != ERROR_OK)
+        return retval;
+
+    return ERROR_OK;
+
+}
+
 static const struct command_registration artery_command_handlers[] = {
     {
         .name = "artery",
@@ -439,7 +589,7 @@ const struct flash_driver artery_flash = {
     .name = "artery",
     .commands = artery_command_handlers,
     .flash_bank_command = artery_flash_bank_command,
-    .erase = NULL,
+    .erase = artery_erase,
     .protect = NULL,
     .write = NULL,
 	.read = default_flash_read,
